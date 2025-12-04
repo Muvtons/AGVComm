@@ -10,7 +10,7 @@ void webSocketEventHandler(uint8_t num, WStype_t type, uint8_t * payload, size_t
 
 // WebSocket event wrapper
 void webSocketEventHandler(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-  webSocketEvent(num, type, payload, length);
+  agvNetwork.webSocketEvent(num, type, payload, length);
 }
 
 void AGVCoreNetwork::begin(const char* deviceName, const char* adminUser, const char* adminPass) {
@@ -286,13 +286,8 @@ void AGVCoreNetwork::processSerialInput() {
             priority = 1;
           }
           
-          // Send to command callback if registered
-          if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
-            if (commandCallback) {
-              commandCallback(serialBuffer, 1, priority); // source=1 (serial)
-            }
-            xSemaphoreGive(mutex);
-          }
+          // Process command
+          processCommand(serialBuffer, 1); // source=1 (serial)
           
           // Echo back to serial
           Serial.printf("[SERIAL] Executed: %s\n", serialBuffer);
@@ -322,6 +317,71 @@ String AGVCoreNetwork::getSessionToken() {
     token += String(random(0, 16), HEX);
   }
   return token;
+}
+
+void AGVCoreNetwork::processCommand(const char* cmd, uint8_t source) {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
+  // Determine priority
+  uint8_t priority = 0;
+  String cmdStr = String(cmd);
+  if (cmdStr.equalsIgnoreCase("STOP") || cmdStr.equalsIgnoreCase("ABORT") || 
+      cmdStr.startsWith("PATH:") || cmdStr.equalsIgnoreCase("START")) {
+    priority = 1;
+  }
+  
+  // Send to command callback if registered
+  if (commandCallback) {
+    commandCallback(cmd, source, priority);
+  }
+  
+  xSemaphoreGive(mutex);
+}
+
+// WebSocket event handler - FIXED IMPLEMENTATION
+void AGVCoreNetwork::webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.printf("[WS] Client #%u disconnected\n", num);
+      break;
+      
+    case WStype_CONNECTED:
+      {
+        if (webSocket) {
+          IPAddress ip = webSocket->remoteIP(num);
+          Serial.printf("[WS] Client #%u connected from %d.%d.%d.%d\n", 
+                       num, ip[0], ip[1], ip[2], ip[3]);
+          webSocket->sendTXT(num, "AGV Connected - Ready for commands");
+        }
+      }
+      break;
+      
+    case WStype_TEXT:
+      {
+        char cmd[65];
+        snprintf(cmd, sizeof(cmd), "%.*s", length, (char*)payload);
+        
+        Serial.printf("\n[WS] Command received from client #%u: '%s'\n", num, cmd);
+        
+        // Process command immediately
+        processCommand(cmd, 0);  // 0 = WebSocket source
+        
+        // Echo back to sender
+        if (webSocket) {
+          String response = "Received: " + String(cmd);
+          webSocket->sendTXT(num, response);
+          
+          // Broadcast to all other clients
+          String broadcastMsg = "CLIENT: " + String(cmd);
+          webSocket->broadcastTXT(broadcastMsg);
+        }
+      }
+      break;
+  }
+  
+  xSemaphoreGive(mutex);
 }
 
 // Web route handlers (THREAD SAFE)

@@ -42,6 +42,9 @@ public:
   // Emergency broadcast (bypasses normal queue)
   void broadcastEmergency(const char* message);
   
+  // WebSocket event handler (public for library access)
+  void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
+  
   // Library handles everything else automatically
   void loop(); // Called automatically in background task
 
@@ -91,6 +94,9 @@ private:
   void cleanupServer();
   void cleanupWebSocket();
   void cleanupDNSServer();
+  
+  // Command processing
+  void processCommand(const char* cmd, uint8_t source);
 };
 
 } // namespace AGVCoreNetworkLib
