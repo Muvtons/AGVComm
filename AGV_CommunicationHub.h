@@ -47,9 +47,9 @@ public:
 
 private:
   // Internal implementation details hidden from user
-  WebServer* server;
-  WebSocketsServer* webSocket;
-  DNSServer* dnsServer;
+  WebServer* server = nullptr;
+  WebSocketsServer* webSocket = nullptr;
+  DNSServer* dnsServer = nullptr;
   Preferences preferences;
   
   String stored_ssid;
@@ -59,11 +59,12 @@ private:
   String sessionToken;
   
   bool isAPMode = false;
-  const char* mdnsName;
+  const char* mdnsName = nullptr;
   const char* ap_ssid = "AGV_Controller_Setup";
   const char* ap_password = "12345678";
   
-  CommandCallback commandCallback = NULL;
+  CommandCallback commandCallback = nullptr;
+  SemaphoreHandle_t mutex = nullptr;  // Added mutex for thread safety
   
   // Internal methods (hidden from user)
   void setupWiFi();
@@ -82,6 +83,11 @@ private:
   void handleScan();
   void handleSaveWiFi();
   void handleCaptivePortal();
+  
+  // Cleanup methods
+  void cleanupServer();
+  void cleanupWebSocket();
+  void cleanupDNSServer();
 };
 
 #endif

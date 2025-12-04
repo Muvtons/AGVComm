@@ -11,6 +11,9 @@ void webSocketEventHandler(uint8_t num, WStype_t type, uint8_t * payload, size_t
 void AGV_CommunicationHub::begin(const char* deviceName, const char* adminUser, const char* adminPass) {
   Serial.println("\n[LIB] Initializing AGV Communication Hub...");
   
+  // Initialize mutex for thread safety (CRITICAL FIX)
+  mutex = xSemaphoreCreateMutex();
+  
   // Store configuration
   this->mdnsName = deviceName;
   this->admin_username = adminUser;
@@ -35,7 +38,7 @@ void AGV_CommunicationHub::begin(const char* deviceName, const char* adminUser, 
       hub->core0Task(NULL);
     },
     "CommHubTask",
-    12000,  // Stack size
+    16384,  // Increased stack size (CRITICAL FIX)
     this,
     1,      // Priority
     NULL,
@@ -46,22 +49,57 @@ void AGV_CommunicationHub::begin(const char* deviceName, const char* adminUser, 
 }
 
 void AGV_CommunicationHub::setCommandCallback(CommandCallback callback) {
-  this->commandCallback = callback;
-  Serial.println("[LIB] Command callback registered");
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+    this->commandCallback = callback;
+    xSemaphoreGive(mutex);
+    Serial.println("[LIB] Command callback registered");
+  }
 }
 
 void AGV_CommunicationHub::sendStatus(const char* status) {
-  if (!isAPMode && webSocket) {
-    webSocket->broadcastTXT(status);
+  if (!status || strlen(status) == 0) return;
+  
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+    if (!isAPMode && webSocket) {
+      webSocket->broadcastTXT(status);
+    }
+    xSemaphoreGive(mutex);
   }
   Serial.printf("[STATUS] %s\n", status);
 }
 
 void AGV_CommunicationHub::broadcastEmergency(const char* message) {
-  if (!isAPMode && webSocket) {
-    webSocket->broadcastTXT(String("EMERGENCY: ") + message);
+  if (!message || strlen(message) == 0) return;
+  
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+    if (!isAPMode && webSocket) {
+      webSocket->broadcastTXT(String("EMERGENCY: ") + message);
+    }
+    xSemaphoreGive(mutex);
   }
   Serial.printf("!!! EMERGENCY: %s\n", message);
+}
+
+void AGV_CommunicationHub::cleanupServer() {
+  if (server) {
+    delete server;
+    server = nullptr;
+  }
+}
+
+void AGV_CommunicationHub::cleanupWebSocket() {
+  if (webSocket) {
+    delete webSocket;
+    webSocket = nullptr;
+  }
+}
+
+void AGV_CommunicationHub::cleanupDNSServer() {
+  if (dnsServer) {
+    dnsServer->stop();
+    delete dnsServer;
+    dnsServer = nullptr;
+  }
 }
 
 void AGV_CommunicationHub::setupWiFi() {
@@ -75,6 +113,12 @@ void AGV_CommunicationHub::setupWiFi() {
 }
 
 void AGV_CommunicationHub::startAPMode() {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) != pdPASS) return;
+  
+  cleanupServer();
+  cleanupWebSocket();
+  cleanupDNSServer();
+  
   Serial.println("\n[LIB] 📡 Starting Access Point Mode");
   
   WiFi.mode(WIFI_AP);
@@ -96,10 +140,17 @@ void AGV_CommunicationHub::startAPMode() {
   setupRoutes();
   server->begin();
   
+  xSemaphoreGive(mutex);
   Serial.println("[LIB] ✅ AP Mode Web Server Started");
 }
 
 void AGV_CommunicationHub::startStationMode() {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(1000)) != pdPASS) return;
+  
+  cleanupServer();
+  cleanupWebSocket();
+  cleanupDNSServer();
+  
   Serial.println("\n[LIB] 🌐 Starting Station Mode");
   
   WiFi.mode(WIFI_STA);
@@ -135,10 +186,12 @@ void AGV_CommunicationHub::startStationMode() {
     setupRoutes();
     server->begin();
     
+    xSemaphoreGive(mutex);
     Serial.println("[LIB] ✅ Station Mode Web Server Started");
     Serial.println("[LIB] ✅ WebSocket Server Started (Port 81)");
     
   } else {
+    xSemaphoreGive(mutex);
     Serial.println("\n[LIB] ❌ WiFi connection failed");
     Serial.println("[LIB] Falling back to AP mode...");
     startAPMode();
@@ -146,6 +199,8 @@ void AGV_CommunicationHub::startStationMode() {
 }
 
 void AGV_CommunicationHub::setupRoutes() {
+  if (!server) return;
+  
   if (isAPMode) {
     // AP Mode routes (setup wizard)
     server->on("/", HTTP_GET, [this](){ this->handleWiFiSetup(); });
@@ -165,20 +220,29 @@ void AGV_CommunicationHub::core0Task(void *parameter) {
   Serial.println("[CORE0] Communication task started on Core 0");
   
   while(1) {
-    if (isAPMode && dnsServer) {
-      dnsServer->processNextRequest();
+    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(50)) == pdPASS) {
+      // Handle AP mode DNS requests
+      if (isAPMode && dnsServer) {
+        dnsServer->processNextRequest();
+      }
+      
+      // Handle web server requests
+      if (server) {
+        server->handleClient();
+      }
+      
+      // Handle WebSocket and serial input in station mode
+      if (!isAPMode) {
+        if (webSocket) {
+          webSocket->loop();
+        }
+        processSerialInput();
+      }
+      
+      xSemaphoreGive(mutex);
     }
     
-    if (server) {
-      server->handleClient();
-    }
-    
-    if (!isAPMode && webSocket) {
-      webSocket->loop();
-      processSerialInput();
-    }
-    
-    delay(1); // Yield to other tasks
+    delay(10); // Increased delay for stability (CRITICAL FIX)
   }
 }
 
@@ -206,16 +270,22 @@ void AGV_CommunicationHub::processSerialInput() {
           }
           
           // Send to command callback if registered
-          if (commandCallback) {
-            commandCallback(serialBuffer, 1, priority); // source=1 (serial)
+          if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+            if (commandCallback) {
+              commandCallback(serialBuffer, 1, priority); // source=1 (serial)
+            }
+            xSemaphoreGive(mutex);
           }
           
           // Echo back to serial
           Serial.printf("[SERIAL] Executed: %s\n", serialBuffer);
           
           // Broadcast to web clients
-          if (webSocket) {
-            webSocket->broadcastTXT(String("SERIAL: ") + serialBuffer);
+          if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+            if (!isAPMode && webSocket) {
+              webSocket->broadcastTXT(String("SERIAL: ") + serialBuffer);
+            }
+            xSemaphoreGive(mutex);
           }
         }
         
@@ -224,6 +294,9 @@ void AGV_CommunicationHub::processSerialInput() {
     } else if (bufferIndex < sizeof(serialBuffer) - 1) {
       serialBuffer[bufferIndex++] = c;
     }
+    
+    // Prevent watchdog timeout during long serial input
+    vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
 
@@ -235,8 +308,10 @@ String AGV_CommunicationHub::getSessionToken() {
   return token;
 }
 
-// WebSocket event handler - CORRECTED FOR ESP32 WEBSOCKETS LIBRARY
+// WebSocket event handler - THREAD SAFE
 void AGV_CommunicationHub::handleWebSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
   switch(type) {
     case WStype_DISCONNECTED:
       Serial.printf("[WS] Client #%u disconnected\n", num);
@@ -244,10 +319,12 @@ void AGV_CommunicationHub::handleWebSocketEvent(uint8_t num, WStype_t type, uint
       
     case WStype_CONNECTED:
       {
-        IPAddress ip = webSocket->remoteIP(num);
-        Serial.printf("[WS] Client #%u connected from %d.%d.%d.%d\n", 
-                     num, ip[0], ip[1], ip[2], ip[3]);
-        webSocket->sendTXT(num, "ESP32 Connected - Ready for commands");
+        if (webSocket) {
+          IPAddress ip = webSocket->remoteIP(num);
+          Serial.printf("[WS] Client #%u connected from %d.%d.%d.%d\n", 
+                       num, ip[0], ip[1], ip[2], ip[3]);
+          webSocket->sendTXT(num, "ESP32 Connected - Ready for commands");
+        }
       }
       break;
       
@@ -272,43 +349,53 @@ void AGV_CommunicationHub::handleWebSocketEvent(uint8_t num, WStype_t type, uint
         }
         
         // Echo back to sender
-        String response = "Received: " + String(cmd);
-        webSocket->sendTXT(num, response);
-        
-        // FIXED: Use broadcastTXT instead of trying to iterate clients
-        // This is the correct way to send to all clients in ESP32 WebSockets library
         if (webSocket) {
+          String response = "Received: " + String(cmd);
+          webSocket->sendTXT(num, response);
+          
+          // Broadcast to all clients using the proper method
           String broadcastMsg = "CLIENT: " + String(cmd);
           webSocket->broadcastTXT(broadcastMsg);
         }
       }
       break;
   }
+  
+  xSemaphoreGive(mutex);
 }
 
-// Web route handlers (with null checks)
+// Web route handlers (THREAD SAFE)
 void AGV_CommunicationHub::handleRoot() {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
   if (server) {
     server->send_P(200, "text/html", loginPage);
   }
+  
+  xSemaphoreGive(mutex);
 }
 
 void AGV_CommunicationHub::handleLogin() {
-  if (!server || server->method() != HTTP_POST) return;
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
+  if (!server || server->method() != HTTP_POST) {
+    xSemaphoreGive(mutex);
+    return;
+  }
   
   String body = server->arg("plain");
   
   int userStart = body.indexOf("\"username\":\"") + 12;
   int userEnd = body.indexOf("\"", userStart);
   String username = "";
-  if (userStart > 12 && userEnd > userStart && userEnd < body.length()) {
+  if (userStart > 12 && userEnd > userStart && userEnd < (int)body.length()) {
     username = body.substring(userStart, userEnd);
   }
   
   int passStart = body.indexOf("\"password\":\"") + 12;
   int passEnd = body.indexOf("\"", passStart);
   String password = "";
-  if (passStart > 12 && passEnd > passStart && passEnd < body.length()) {
+  if (passStart > 12 && passEnd > passStart && passEnd < (int)body.length()) {
     password = body.substring(passStart, passEnd);
   }
   
@@ -323,22 +410,37 @@ void AGV_CommunicationHub::handleLogin() {
     server->send(200, "application/json", "{\"success\":false}");
     Serial.println("[AUTH] ❌ Login failed");
   }
+  
+  xSemaphoreGive(mutex);
 }
 
 void AGV_CommunicationHub::handleDashboard() {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
   if (server) {
     server->send_P(200, "text/html", mainPage);
   }
+  
+  xSemaphoreGive(mutex);
 }
 
 void AGV_CommunicationHub::handleWiFiSetup() {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
   if (server) {
     server->send_P(200, "text/html", wifiSetupPage);
   }
+  
+  xSemaphoreGive(mutex);
 }
 
 void AGV_CommunicationHub::handleScan() {
-  if (!server) return;
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
+  if (!server) {
+    xSemaphoreGive(mutex);
+    return;
+  }
   
   Serial.println("[WIFI] Scanning networks...");
   int n = WiFi.scanNetworks();
@@ -356,24 +458,31 @@ void AGV_CommunicationHub::handleScan() {
   json += "]";
   server->send(200, "application/json", json);
   Serial.printf("[WIFI] Found %d networks\n", n);
+  
+  xSemaphoreGive(mutex);
 }
 
 void AGV_CommunicationHub::handleSaveWiFi() {
-  if (!server || server->method() != HTTP_POST) return;
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
+  if (!server || server->method() != HTTP_POST) {
+    xSemaphoreGive(mutex);
+    return;
+  }
   
   String body = server->arg("plain");
   
   int ssidStart = body.indexOf("\"ssid\":\"") + 8;
   int ssidEnd = body.indexOf("\"", ssidStart);
   String ssid = "";
-  if (ssidStart > 8 && ssidEnd > ssidStart && ssidEnd < body.length()) {
+  if (ssidStart > 8 && ssidEnd > ssidStart && ssidEnd < (int)body.length()) {
     ssid = body.substring(ssidStart, ssidEnd);
   }
   
   int passStart = body.indexOf("\"password\":\"") + 12;
   int passEnd = body.indexOf("\"", passStart);
   String password = "";
-  if (passStart > 12 && passEnd > passStart && passEnd < body.length()) {
+  if (passStart > 12 && passEnd > passStart && passEnd < (int)body.length()) {
     password = body.substring(passStart, passEnd);
   }
   
@@ -387,14 +496,20 @@ void AGV_CommunicationHub::handleSaveWiFi() {
   
   server->send(200, "application/json", "{\"success\":true}");
   
+  xSemaphoreGive(mutex);
+  
   Serial.println("[WIFI] ✅ Credentials saved. Restarting...");
   delay(1000);
   ESP.restart();
 }
 
 void AGV_CommunicationHub::handleCaptivePortal() {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  
   if (server) {
     server->sendHeader("Location", "http://192.168.4.1/setup", true);
     server->send(302, "text/plain", "");
   }
+  
+  xSemaphoreGive(mutex);
 }
