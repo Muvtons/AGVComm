@@ -1,12 +1,10 @@
 #include "AGVCoreNetwork.h"
 #include "AGVCoreNetwork_Resources.h"
+#include <Arduino.h>
 
 using namespace AGVCoreNetworkLib;
 
 AGVCoreNetwork agvNetwork; // Global instance
-
-// Forward declarations
-void webSocketEventHandler(uint8_t num, WStype_t type, uint8_t * payload, size_t length);
 
 // WebSocket event wrapper
 void webSocketEventHandler(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
@@ -18,15 +16,15 @@ void AGVCoreNetwork::begin(const char* deviceName, const char* adminUser, const 
   
   // Initialize mutex for thread safety
   mutex = xSemaphoreCreateMutex();
+  if (!mutex) {
+    Serial.println("[ERROR] Failed to create network mutex!");
+    return;
+  }
   
   // Store configuration
   this->mdnsName = deviceName;
   this->admin_username = adminUser;
   this->admin_password = adminPass;
-  
-  // Initialize hardware
-  Serial.begin(115200);
-  delay(500);
   
   // Initialize preferences
   preferences.begin("agvnet", false);
@@ -38,74 +36,22 @@ void AGVCoreNetwork::begin(const char* deviceName, const char* adminUser, const 
   setupWiFi();
   
   // Start Core 0 task (handles all communication)
-  xTaskCreatePinnedToCore(
+  if (xTaskCreatePinnedToCore(
     [](void* param) {
       AGVCoreNetwork* net = (AGVCoreNetwork*)param;
       net->core0Task(NULL);
     },
     "AGVNetCore0",
-    16384,  // Stack size
+    10240,  // Reduced stack size
     this,
-    1,      // Priority
+    configMAX_PRIORITIES - 2,  // Slightly lower priority than motion
     &core0TaskHandle,
     0       // Core 0
-  );
+  ) != pdPASS) {
+    Serial.println("[ERROR] Failed to create Core 0 task!");
+  }
   
   Serial.println("[AGVNET] ✅ Network System started on Core 0");
-}
-
-void AGVCoreNetwork::setCommandCallback(CommandCallback callback) {
-  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
-    this->commandCallback = callback;
-    xSemaphoreGive(mutex);
-    Serial.println("[AGVNET] Command callback registered");
-  }
-}
-
-void AGVCoreNetwork::sendStatus(const char* status) {
-  if (!status || strlen(status) == 0) return;
-  
-  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
-    if (!isAPMode && webSocket) {
-      webSocket->broadcastTXT(status);
-    }
-    xSemaphoreGive(mutex);
-  }
-  Serial.printf("[STATUS] %s\n", status);
-}
-
-void AGVCoreNetwork::broadcastEmergency(const char* message) {
-  if (!message || strlen(message) == 0) return;
-  
-  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
-    if (!isAPMode && webSocket) {
-      webSocket->broadcastTXT(String("EMERGENCY: ") + message);
-    }
-    xSemaphoreGive(mutex);
-  }
-  Serial.printf("!!! EMERGENCY: %s\n", message);
-}
-
-void AGVCoreNetwork::cleanupServer() {
-  if (server) {
-    delete server;
-    server = nullptr;
-  }
-}
-
-void AGVCoreNetwork::cleanupWebSocket() {
-  if (webSocket) {
-    delete webSocket;
-    webSocket = nullptr;
-  }
-}
-
-void AGVCoreNetwork::cleanupDNSServer() {
-  if (dnsServer) {
-    dnsServer->stop();
-    delete dnsServer;
-    dnsServer = nullptr;
-  }
 }
 
 void AGVCoreNetwork::setupWiFi() {
@@ -127,9 +73,9 @@ void AGVCoreNetwork::startAPMode() {
   IPAddress IP = WiFi.softAPIP();
   Serial.printf("[AGVNET] AP IP: %d.%d.%d.%d\n", IP[0], IP[1], IP[2], IP[3]);
   Serial.println("[AGVNET] Connect to '" + String(ap_ssid) + "' network");
-  Serial.println("[AGVNET] Open any browser for setup wizard");
+  Serial.println("[AGVNET] Open http://192.168.4.1 for setup");
   
-  delay(100); // Give AP time to start
+  delay(100);
   
   // Create DNS server for captive portal
   dnsServer = new DNSServer();
@@ -137,28 +83,24 @@ void AGVCoreNetwork::startAPMode() {
   
   isAPMode = true;
   
-  // Setup web server - CRITICAL ORDER FOR CAPTIVE PORTAL
+  // Setup web server
   server = new WebServer(80);
   
-  // Setup routes for AP mode - IMPORTANT ORDER (onNotFound FIRST!)
-  server->onNotFound([this](){ this->handleNotFound(); });
-  server->on("/", HTTP_GET, [this](){ this->handleRootRedirect(); });
+  // Setup routes for AP mode
+  server->on("/", HTTP_GET, [this](){ this->handleRoot(); });
   server->on("/setup", HTTP_GET, [this](){ this->handleWiFiSetup(); });
   server->on("/scan", HTTP_GET, [this](){ this->handleScan(); });
   server->on("/savewifi", HTTP_POST, [this](){ this->handleSaveWiFi(); });
   
-  // Common captive portal detection URLs
-  server->on("/generate_204", HTTP_GET, [this](){ this->handleRootRedirect(); });
-  server->on("/fwlink", HTTP_GET, [this](){ this->handleRootRedirect(); });
-  server->on("/redirect", HTTP_GET, [this](){ this->handleRootRedirect(); });
-  server->on("/hotspot-detect.html", HTTP_GET, [this](){ this->handleRootRedirect(); });
-  server->on("/connectivity-check.html", HTTP_GET, [this](){ this->handleRootRedirect(); });
-  server->on("/check_network_status.txt", HTTP_GET, [this](){ this->handleRootRedirect(); });
-  server->on("/ncsi.txt", HTTP_GET, [this](){ this->handleRootRedirect(); });
+  // Captive portal redirects
+  server->on("/generate_204", HTTP_GET, [this](){ this->handleRoot(); });
+  server->on("/fwlink", HTTP_GET, [this](){ this->handleRoot(); });
+  server->on("/hotspot-detect.html", HTTP_GET, [this](){ this->handleRoot(); });
+  
+  server->onNotFound([this](){ this->handleNotFound(); });
   
   server->begin();
   Serial.println("[AGVNET] ✅ AP Mode Web Server Started");
-  Serial.println("[AGVNET] ✅ Captive portal enabled - all requests redirected to setup");
 }
 
 void AGVCoreNetwork::startStationMode() {
@@ -170,7 +112,7 @@ void AGVCoreNetwork::startStationMode() {
   Serial.printf("[AGVNET] Connecting to: %s\n", stored_ssid.c_str());
   
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
     delay(500);
     Serial.print(".");
     attempts++;
@@ -188,7 +130,7 @@ void AGVCoreNetwork::startStationMode() {
     
     isAPMode = false;
     
-    // Setup web server
+    // Setup web server and WebSocket
     server = new WebServer(80);
     webSocket = new WebSocketsServer(81);
     webSocket->begin();
@@ -208,18 +150,26 @@ void AGVCoreNetwork::startStationMode() {
 }
 
 void AGVCoreNetwork::setupRoutes() {
-  if (!server) return;
+  if (!server || isAPMode) return;
   
-  if (isAPMode) {
-    // This should never be called in AP mode - routes are set in startAPMode()
-    return;
-  } else {
-    // Station Mode routes (control interface)
-    server->on("/", HTTP_GET, [this](){ this->handleRoot(); });
-    server->on("/login", HTTP_POST, [this](){ this->handleLogin(); });
-    server->on("/dashboard", HTTP_GET, [this](){ this->handleDashboard(); });
-    server->onNotFound([this](){ this->handleNotFound(); });
-  }
+  // Protected routes (require authentication)
+  server->on("/", HTTP_GET, [this](){ 
+    if (validateToken()) this->handleDashboard(); 
+  });
+  
+  server->on("/login", HTTP_POST, [this](){ this->handleLogin(); });
+  server->on("/command", HTTP_POST, [this](){ 
+    if (validateToken()) this->handleCommand(); 
+  });
+  
+  // Public routes
+  server->on("/status", HTTP_GET, [this](){ 
+    this->server->send(200, "application/json", 
+      "{\"emergency\":" + String(systemEmergency) + 
+      ",\"connected\":" + String(WiFi.status() == WL_CONNECTED) + "}");
+  });
+  
+  server->onNotFound([this](){ this->handleNotFound(); });
 }
 
 void AGVCoreNetwork::core0Task(void *parameter) {
@@ -234,14 +184,13 @@ void AGVCoreNetwork::core0Task(void *parameter) {
       server->handleClient();
     }
     
-    if (!isAPMode) {
-      if (webSocket) {
-        webSocket->loop();
-      }
-      processSerialInput();
+    if (webSocket) {
+      webSocket->loop();
     }
     
-    delay(1);  // Short delay for responsiveness
+    processSerialInput();
+    
+    delay(1);
   }
 }
 
@@ -249,7 +198,7 @@ void AGVCoreNetwork::processSerialInput() {
   static char serialBuffer[64];
   static int bufferIndex = 0;
   
-  while (Serial.available() > 0) {
+  while (Serial.available() > 0 && bufferIndex < 63) {
     char c = Serial.read();
     
     if (c == '\n' || c == '\r') {
@@ -261,69 +210,74 @@ void AGVCoreNetwork::processSerialInput() {
         if (cmd.length() > 0) {
           Serial.printf("\n[SERIAL] Command received: '%s'\n", cmd.c_str());
           
-          // Determine priority (emergency commands get high priority)
-          uint8_t priority = 0;
-          if (cmd.equalsIgnoreCase("STOP") || cmd.equalsIgnoreCase("ABORT") || 
-              cmd.equalsIgnoreCase("EMERGENCY")) {
-            priority = 1;
-          }
-          
-          // Process command with mutex protection
-          if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
-            processCommandUnsafe(serialBuffer, 1); // source=1 (serial)
-            xSemaphoreGive(mutex);
-          }
+          // Process command immediately
+          processSerialCommand(serialBuffer);
           
           // Echo back to serial
           Serial.printf("[SERIAL] Executed: %s\n", serialBuffer);
           
-          // Broadcast to web clients
-          if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
-            if (!isAPMode && webSocket) {
-              webSocket->broadcastTXT(String("SERIAL: ") + serialBuffer);
-            }
-            xSemaphoreGive(mutex);
+          // Broadcast to web clients (if not in AP mode)
+          if (!isAPMode && !systemEmergency) {
+            String broadcastMsg = "SERIAL: " + cmd;
+            sendStatus(broadcastMsg.c_str());
           }
         }
         
         bufferIndex = 0;
       }
-    } else if (bufferIndex < sizeof(serialBuffer) - 1) {
+    } else {
       serialBuffer[bufferIndex++] = c;
     }
     
-    vTaskDelay(pdMS_TO_TICKS(1));
+    delay(1); // Prevent watchdog trigger
   }
 }
 
-String AGVCoreNetwork::getSessionToken() {
-  String token = "";
-  for(int i = 0; i < 32; i++) {
-    token += String(random(0, 16), HEX);
+void AGVCoreNetwork::processSerialCommand(const char* cmd) {
+  // Emergency commands bypass everything
+  String command = String(cmd);
+  command.trim();
+  
+  if (command.equalsIgnoreCase("STOP") || command.equalsIgnoreCase("ABORT")) {
+    if (emergencyStateCallback) {
+      emergencyStateCallback(true); // Trigger system-wide emergency
+    }
+    return;
   }
-  return token;
-}
-
-// Command processing without mutex (called from within mutex-protected context)
-void AGVCoreNetwork::processCommandUnsafe(const char* cmd, uint8_t source) {
-  // Determine priority
-  uint8_t priority = 0;
-  String cmdStr = String(cmd);
-  if (cmdStr.equalsIgnoreCase("STOP") || cmdStr.equalsIgnoreCase("ABORT") || 
-      cmdStr.startsWith("PATH:") || cmdStr.equalsIgnoreCase("START")) {
-    priority = 1;
+  
+  if (command.equalsIgnoreCase("CLEAR_EMERGENCY")) {
+    if (emergencyStateCallback) {
+      emergencyStateCallback(false); // Clear system-wide emergency
+    }
+    return;
+  }
+  
+  // Only process valid commands if not in emergency state
+  if (systemEmergency) {
+    Serial.println("[SERIAL] Command blocked: System emergency active");
+    return;
   }
   
   // Send to command callback if registered
   if (commandCallback) {
-    commandCallback(cmd, source, priority);
+    commandCallback(cmd);
   }
 }
 
-// WebSocket event handler - FIXED IMPLEMENTATION
-void AGVCoreNetwork::webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
-  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+void AGVCoreNetwork::processWebCommand(const char* cmd) {
+  // Only process if not in emergency state
+  if (systemEmergency) {
+    Serial.println("[WEB] Command blocked: System emergency active");
+    return;
+  }
   
+  // Send to command callback if registered
+  if (commandCallback) {
+    commandCallback(cmd);
+  }
+}
+
+void AGVCoreNetwork::webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
   switch(type) {
     case WStype_DISCONNECTED:
       Serial.printf("[WS] Client #%u disconnected\n", num);
@@ -331,83 +285,147 @@ void AGVCoreNetwork::webSocketEvent(uint8_t num, WStype_t type, uint8_t * payloa
       
     case WStype_CONNECTED:
       {
-        if (webSocket) {
-          IPAddress ip = webSocket->remoteIP(num);
-          Serial.printf("[WS] Client #%u connected from %d.%d.%d.%d\n", 
-                       num, ip[0], ip[1], ip[2], ip[3]);
-          webSocket->sendTXT(num, "AGV Connected - Ready for commands");
-        }
+        IPAddress ip = webSocket->remoteIP(num);
+        Serial.printf("[WS] Client #%u connected from %d.%d.%d.%d\n", 
+                     num, ip[0], ip[1], ip[2], ip[3]);
+        webSocket->sendTXT(num, "AGV Connected - Ready for commands");
       }
       break;
       
     case WStype_TEXT:
       {
-        char cmd[65];
-        snprintf(cmd, sizeof(cmd), "%.*s", length, (char*)payload);
+        // Copy command safely without holding mutex
+        char cmdCopy[65];
+        snprintf(cmdCopy, sizeof(cmdCopy), "%.*s", (int)length, (char*)payload);
         
-        Serial.printf("\n[WS] Command received from client #%u: '%s'\n", num, cmd);
+        Serial.printf("\n[WS] Command received from client #%u: '%s'\n", num, cmdCopy);
         
-        // Process command immediately
-        processCommandUnsafe(cmd, 0);  // 0 = WebSocket source
+        // Process command
+        processWebCommand(cmdCopy);
         
-        // Echo back to sender
-        if (webSocket) {
-          String response = "Received: " + String(cmd);
-          webSocket->sendTXT(num, response);
-          
-          // Broadcast to all other clients
-          String broadcastMsg = "CLIENT: " + String(cmd);
-          webSocket->broadcastTXT(broadcastMsg);
-        }
+        // Send confirmation back to client
+        String response = "ACK: " + String(cmdCopy);
+        webSocket->sendTXT(num, response.c_str());
+        
+        // Broadcast to all clients
+        String broadcastMsg = "WS: " + String(cmdCopy);
+        webSocket->broadcastTXT(broadcastMsg.c_str());
       }
       break;
   }
-  
-  xSemaphoreGive(mutex);
 }
 
-// Web route handlers (SPECIAL HANDLING FOR AP MODE)
-void AGVCoreNetwork::handleRoot() {
-  if (isAPMode) {
-    // In AP mode, no mutex protection needed for redirect
-    server->sendHeader("Location", "/setup", true);
-    server->send(302, "text/plain", "");
-  } else {
-    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
-    server->send_P(200, "text/html", loginPage);
+// Callback registration
+void AGVCoreNetwork::setCommandCallback(CommandCallback callback) {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+    commandCallback = callback;
     xSemaphoreGive(mutex);
+    Serial.println("[AGVNET] Command callback registered");
   }
 }
 
-void AGVCoreNetwork::handleRootRedirect() {
-  // In AP mode, no mutex protection needed for redirect
-  server->sendHeader("Location", "/setup", true);
-  server->send(302, "text/plain", "");
+void AGVCoreNetwork::setEmergencyStateCallback(EmergencyStateCallback callback) {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+    emergencyStateCallback = callback;
+    xSemaphoreGive(mutex);
+    Serial.println("[AGVNET] Emergency state callback registered");
+  }
+}
+
+void AGVCoreNetwork::setStatusCallback(StatusCallback callback) {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+    statusCallback = callback;
+    xSemaphoreGive(mutex);
+    Serial.println("[AGVNET] Status callback registered");
+  }
+}
+
+// Status and emergency handling
+void AGVCoreNetwork::sendStatus(const char* status) {
+  if (!status || strlen(status) == 0 || isAPMode) return;
+  
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+    if (webSocket) {
+      webSocket->broadcastTXT(status);
+    }
+    xSemaphoreGive(mutex);
+  }
+  
+  // Also send to serial for logging
+  Serial.printf("[STATUS] %s\n", status);
+  
+  // Forward to status callback if registered
+  if (statusCallback) {
+    statusCallback(status);
+  }
+}
+
+void AGVCoreNetwork::broadcastEmergency(const char* message) {
+  if (!message || strlen(message) == 0) return;
+  
+  systemEmergency = true;
+  
+  Serial.printf("!!! NETWORK EMERGENCY: %s\n", message);
+  
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+    if (webSocket) {
+      String emergencyMsg = "SYSTEM_EMERGENCY: " + String(message);
+      webSocket->broadcastTXT(emergencyMsg.c_str());
+    }
+    xSemaphoreGive(mutex);
+  }
+  
+  // Also send to serial
+  Serial.println("!!! SYSTEM EMERGENCY STATE ACTIVE !!!");
+  
+  // Trigger system-wide emergency if callback exists
+  if (emergencyStateCallback) {
+    emergencyStateCallback(true);
+  }
+}
+
+void AGVCoreNetwork::clearEmergencyState() {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+    systemEmergency = false;
+    xSemaphoreGive(mutex);
+  }
+  
+  Serial.println("[AGVNET] System emergency state cleared");
+  
+  // Notify web clients
+  sendStatus("SYSTEM_NORMAL: Emergency cleared");
+  
+  // Clear system-wide emergency if callback exists
+  if (emergencyStateCallback) {
+    emergencyStateCallback(false);
+  }
+}
+
+// Web route handlers
+void AGVCoreNetwork::handleRoot() {
+  if (isAPMode) {
+    server->send_P(200, "text/html", wifiSetupPage);
+  } else {
+    server->send_P(200, "text/html", loginPage);
+  }
 }
 
 void AGVCoreNetwork::handleLogin() {
-  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
-  
-  if (!server || server->method() != HTTP_POST) {
-    xSemaphoreGive(mutex);
+  if (server->method() != HTTP_POST) {
+    server->send(405, "text/plain", "Method Not Allowed");
     return;
   }
   
   String body = server->arg("plain");
   
+  // Parse JSON manually to avoid String fragmentation
   int userStart = body.indexOf("\"username\":\"") + 12;
   int userEnd = body.indexOf("\"", userStart);
-  String username = "";
-  if (userStart > 12 && userEnd > userStart && userEnd < (int)body.length()) {
-    username = body.substring(userStart, userEnd);
-  }
+  String username = (userStart > 12 && userEnd > userStart) ? body.substring(userStart, userEnd) : "";
   
   int passStart = body.indexOf("\"password\":\"") + 12;
   int passEnd = body.indexOf("\"", passStart);
-  String password = "";
-  if (passStart > 12 && passEnd > passStart && passEnd < (int)body.length()) {
-    password = body.substring(passStart, passEnd);
-  }
+  String password = (passStart > 12 && passEnd > passStart) ? body.substring(passStart, passEnd) : "";
   
   Serial.printf("\n[AUTH] Login attempt: '%s'\n", username.c_str());
   
@@ -420,60 +438,49 @@ void AGVCoreNetwork::handleLogin() {
     server->send(200, "application/json", "{\"success\":false}");
     Serial.println("[AUTH] ❌ Login failed");
   }
-  
-  xSemaphoreGive(mutex);
 }
 
 void AGVCoreNetwork::handleDashboard() {
-  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
+  if (!validateToken()) return;
   
-  if (server) {
-    server->send_P(200, "text/html", mainPage);
+  // Include emergency status in dashboard
+  String page = String(mainPage);
+  if (systemEmergency) {
+    page.replace("AGV: Waiting for connection...", "AGV: !!! EMERGENCY STATE ACTIVE !!!");
   }
-  
-  xSemaphoreGive(mutex);
+  server->send(200, "text/html", page.c_str());
 }
 
 void AGVCoreNetwork::handleWiFiSetup() {
-  // In AP mode, no mutex protection needed for page serving
-  if (server) {
-    server->send_P(200, "text/html", wifiSetupPage);
-  }
+  server->send_P(200, "text/html", wifiSetupPage);
 }
 
 void AGVCoreNetwork::handleScan() {
-  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
-  
-  if (!server) {
-    xSemaphoreGive(mutex);
-    return;
+  if (isAPMode) {
+    Serial.println("[WIFI] Scanning networks...");
+    int n = WiFi.scanNetworks();
+    String json = "[";
+    
+    for (int i = 0; i < n; i++) {
+      if (i > 0) json += ",";
+      json += "{";
+      json += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
+      json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+      json += "\"secured\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false");
+      json += "}";
+    }
+    
+    json += "]";
+    server->send(200, "application/json", json);
+    Serial.printf("[WIFI] Found %d networks\n", n);
+  } else {
+    server->send(403, "text/plain", "Forbidden in station mode");
   }
-  
-  Serial.println("[WIFI] Scanning networks...");
-  int n = WiFi.scanNetworks();
-  String json = "[";
-  
-  for (int i = 0; i < n; i++) {
-    if (i > 0) json += ",";
-    json += "{";
-    json += "\"ssid\":\"" + WiFi.SSID(i) + "\",";
-    json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
-    json += "\"secured\":" + String(WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false");
-    json += "}";
-  }
-  
-  json += "]";
-  server->send(200, "application/json", json);
-  Serial.printf("[WIFI] Found %d networks\n", n);
-  
-  xSemaphoreGive(mutex);
 }
 
 void AGVCoreNetwork::handleSaveWiFi() {
-  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
-  
-  if (!server || server->method() != HTTP_POST) {
-    xSemaphoreGive(mutex);
+  if (server->method() != HTTP_POST || !isAPMode) {
+    server->send(403, "text/plain", "Forbidden");
     return;
   }
   
@@ -481,17 +488,11 @@ void AGVCoreNetwork::handleSaveWiFi() {
   
   int ssidStart = body.indexOf("\"ssid\":\"") + 8;
   int ssidEnd = body.indexOf("\"", ssidStart);
-  String ssid = "";
-  if (ssidStart > 8 && ssidEnd > ssidStart && ssidEnd < (int)body.length()) {
-    ssid = body.substring(ssidStart, ssidEnd);
-  }
+  String ssid = (ssidStart > 8 && ssidEnd > ssidStart) ? body.substring(ssidStart, ssidEnd) : "";
   
   int passStart = body.indexOf("\"password\":\"") + 12;
   int passEnd = body.indexOf("\"", passStart);
-  String password = "";
-  if (passStart > 12 && passEnd > passStart && passEnd < (int)body.length()) {
-    password = body.substring(passStart, passEnd);
-  }
+  String password = (passStart > 12 && passEnd > passStart) ? body.substring(passStart, passEnd) : "";
   
   Serial.printf("\n[WIFI] Saving credentials: '%s'\n", ssid.c_str());
   
@@ -503,39 +504,93 @@ void AGVCoreNetwork::handleSaveWiFi() {
   
   server->send(200, "application/json", "{\"success\":true}");
   
-  xSemaphoreGive(mutex);
-  
   Serial.println("[WIFI] ✅ Credentials saved. Restarting...");
   delay(1000);
-  ESP.restart();
+  restartSystem();
 }
 
-void AGVCoreNetwork::handleCaptivePortal() {
-  // This should not be called directly in AP mode
-  String header = "HTTP/1.1 302 Found\r\n";
-  header += "Location: http://192.168.4.1/setup\r\n";
-  header += "Cache-Control: no-cache\r\n";
-  header += "Connection: close\r\n";
-  header += "\r\n";
+void AGVCoreNetwork::handleCommand() {
+  if (server->method() != HTTP_POST || systemEmergency) {
+    server->send(403, "text/plain", systemEmergency ? "Emergency state active" : "Forbidden");
+    return;
+  }
   
-  server->client().write(header.c_str(), header.length());
-  server->client().stop();
+  String body = server->arg("plain");
+  
+  int cmdStart = body.indexOf("\"command\":\"") + 11;
+  int cmdEnd = body.indexOf("\"", cmdStart);
+  String command = (cmdStart > 11 && cmdEnd > cmdStart) ? body.substring(cmdStart, cmdEnd) : "";
+  
+  if (command.length() > 0) {
+    Serial.printf("[WEB] Executing command: '%s'\n", command.c_str());
+    processWebCommand(command.c_str());
+    server->send(200, "application/json", "{\"success\":true}");
+  } else {
+    server->send(400, "application/json", "{\"success\":false,\"error\":\"Invalid command\"}");
+  }
 }
 
 void AGVCoreNetwork::handleNotFound() {
-  if (isAPMode) {
-    // In AP mode, redirect everything to setup - NO MUTEX NEEDED
-    String header = "HTTP/1.1 302 Found\r\n";
-    header += "Location: http://192.168.4.1/setup\r\n";
-    header += "Cache-Control: no-cache\r\n";
-    header += "Connection: close\r\n";
-    header += "\r\n";
+  String message = "File Not Found\n\n";
+  message += "URI: ";
+  message += server->uri();
+  message += "\nMethod: ";
+  message += (server->method() == HTTP_GET) ? "GET" : "POST";
+  message += "\nArguments: ";
+  message += server->args();
+  message += "\n";
+  
+  for (uint8_t i = 0; i < server->args(); i++) {
+    message += " " + server->argName(i) + ": " + server->arg(i) + "\n";
+  }
+  
+  server->send(404, "text/plain", message);
+}
+
+// Utility methods
+String AGVCoreNetwork::getSessionToken() {
+  String token = "";
+  for(int i = 0; i < 32; i++) {
+    token += String(random(0, 16), HEX);
+  }
+  return token;
+}
+
+bool AGVCoreNetwork::validateToken() {
+  if (isAPMode) return true; // No auth in AP mode
+  
+  String auth = server->header("Authorization");
+  if (auth.startsWith("Bearer ") && auth.substring(7) == sessionToken) {
+    return true;
+  }
+  
+  server->send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+  return false;
+}
+
+void AGVCoreNetwork::cleanupResources() {
+  if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) == pdPASS) {
+    if (webSocket) {
+      delete webSocket;
+      webSocket = nullptr;
+    }
     
-    server->client().write(header.c_str(), header.length());
-    server->client().stop();
-  } else {
-    if (xSemaphoreTake(mutex, pdMS_TO_TICKS(100)) != pdPASS) return;
-    server->send(404, "text/plain", "File Not Found");
+    if (server) {
+      delete server;
+      server = nullptr;
+    }
+    
+    if (dnsServer) {
+      dnsServer->stop();
+      delete dnsServer;
+      dnsServer = nullptr;
+    }
+    
     xSemaphoreGive(mutex);
   }
+}
+
+void AGVCoreNetwork::restartSystem() {
+  cleanupResources();
+  ESP.restart();
 }
